@@ -10,8 +10,9 @@ pub mod diesel_exports {
         DbFutureUsage as FutureUsage, DbIntentStatus as IntentStatus,
         DbMandateStatus as MandateStatus, DbMandateType as MandateType,
         DbMerchantStorageScheme as MerchantStorageScheme,
-        DbPaymentMethodIssuerCode as PaymentMethodIssuerCode, DbPayoutStatus as PayoutStatus,
-        DbPayoutType as PayoutType, DbProcessTrackerStatus as ProcessTrackerStatus,
+        DbPaymentMethodIssuerCode as PaymentMethodIssuerCode, DbPaymentSource as PaymentSource,
+        DbPayoutStatus as PayoutStatus, DbPayoutType as PayoutType,
+        DbProcessTrackerStatus as ProcessTrackerStatus, DbReconStatus as ReconStatus,
         DbRefundStatus as RefundStatus, DbRefundType as RefundType,
     };
 }
@@ -373,4 +374,27 @@ pub enum FraudCheckStatus {
     Pending,
     Legit,
     TransactionFailure,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    strum::Display,
+    strum::EnumString,
+    frunk::LabelledGeneric,
+)]
+#[router_derive::diesel_enum(storage_type = "text")]
+#[strum(serialize_all = "snake_case")]
+pub enum FraudCheckLastStep {
+    #[default]
+    Processing,
+    CheckoutOrSale,
+    TransactionOrRecordRefund,
+    Fulfillment,
 }

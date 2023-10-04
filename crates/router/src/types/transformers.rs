@@ -1,5 +1,11 @@
-use api_models::enums as api_enums;
-use common_utils::{crypto::Encryptable, ext_traits::ValueExt, pii};
+// use actix_web::HttpMessage;
+use actix_web::http::header::HeaderMap;
+use api_models::{enums as api_enums, payments};
+use common_utils::{
+    crypto::Encryptable,
+    ext_traits::{StringExt, ValueExt},
+    pii,
+};
 use diesel_models::enums as storage_enums;
 use error_stack::ResultExt;
 use masking::{ExposeInterface, PeekInterface};
@@ -7,6 +13,7 @@ use masking::{ExposeInterface, PeekInterface};
 use super::domain;
 use crate::{
     core::errors,
+    services::authentication::get_header_value_by_key,
     types::{api as api_types, storage},
 };
 
@@ -173,6 +180,58 @@ impl ForeignFrom<storage_enums::MandateAmountData> for api_models::payments::Man
     }
 }
 
+// TODO: remove foreign from since this conversion won't be needed in the router crate once data models is treated as a single & primary source of truth for structure information
+impl ForeignFrom<api_models::payments::MandateData> for data_models::mandates::MandateData {
+    fn foreign_from(d: api_models::payments::MandateData) -> Self {
+        Self {
+            customer_acceptance: d.customer_acceptance.map(|d| {
+                data_models::mandates::CustomerAcceptance {
+                    acceptance_type: match d.acceptance_type {
+                        api_models::payments::AcceptanceType::Online => {
+                            data_models::mandates::AcceptanceType::Online
+                        }
+                        api_models::payments::AcceptanceType::Offline => {
+                            data_models::mandates::AcceptanceType::Offline
+                        }
+                    },
+                    accepted_at: d.accepted_at,
+                    online: d.online.map(|d| data_models::mandates::OnlineMandate {
+                        ip_address: d.ip_address,
+                        user_agent: d.user_agent,
+                    }),
+                }
+            }),
+            mandate_type: d.mandate_type.map(|d| match d {
+                api_models::payments::MandateType::MultiUse(Some(i)) => {
+                    data_models::mandates::MandateDataType::MultiUse(Some(
+                        data_models::mandates::MandateAmountData {
+                            amount: i.amount,
+                            currency: i.currency,
+                            start_date: i.start_date,
+                            end_date: i.end_date,
+                            metadata: i.metadata,
+                        },
+                    ))
+                }
+                api_models::payments::MandateType::SingleUse(i) => {
+                    data_models::mandates::MandateDataType::SingleUse(
+                        data_models::mandates::MandateAmountData {
+                            amount: i.amount,
+                            currency: i.currency,
+                            start_date: i.start_date,
+                            end_date: i.end_date,
+                            metadata: i.metadata,
+                        },
+                    )
+                }
+                api_models::payments::MandateType::MultiUse(None) => {
+                    data_models::mandates::MandateDataType::MultiUse(None)
+                }
+            }),
+        }
+    }
+}
+
 impl ForeignFrom<api_models::payments::MandateAmountData> for storage_enums::MandateAmountData {
     fn foreign_from(from: api_models::payments::MandateAmountData) -> Self {
         Self {
@@ -185,19 +244,23 @@ impl ForeignFrom<api_models::payments::MandateAmountData> for storage_enums::Man
     }
 }
 
-impl ForeignTryFrom<api_enums::IntentStatus> for storage_enums::EventType {
-    type Error = errors::ValidationError;
-
-    fn foreign_try_from(value: api_enums::IntentStatus) -> Result<Self, Self::Error> {
+impl ForeignFrom<api_enums::IntentStatus> for Option<storage_enums::EventType> {
+    fn foreign_from(value: api_enums::IntentStatus) -> Self {
         match value {
-            api_enums::IntentStatus::Succeeded => Ok(Self::PaymentSucceeded),
-            api_enums::IntentStatus::Failed => Ok(Self::PaymentFailed),
-            api_enums::IntentStatus::Processing => Ok(Self::PaymentProcessing),
+            api_enums::IntentStatus::Succeeded => Some(storage_enums::EventType::PaymentSucceeded),
+            api_enums::IntentStatus::Failed => Some(storage_enums::EventType::PaymentFailed),
+            api_enums::IntentStatus::Processing => {
+                Some(storage_enums::EventType::PaymentProcessing)
+            }
             api_enums::IntentStatus::RequiresMerchantAction
-            | api_enums::IntentStatus::RequiresCustomerAction => Ok(Self::ActionRequired),
-            _ => Err(errors::ValidationError::IncorrectValueProvided {
-                field_name: "intent_status",
-            }),
+            | api_enums::IntentStatus::RequiresCustomerAction => {
+                Some(storage_enums::EventType::ActionRequired)
+            }
+            api_enums::IntentStatus::Cancelled
+            | api_enums::IntentStatus::RequiresPaymentMethod
+            | api_enums::IntentStatus::RequiresConfirmation
+            | api_enums::IntentStatus::RequiresCapture
+            | api_enums::IntentStatus::PartiallyCaptured => None,
         }
     }
 }
@@ -306,7 +369,7 @@ impl ForeignTryFrom<api_models::payments::PaymentMethodData> for api_enums::Paym
             api_models::payments::PaymentMethodData::BankDebit(..) => Ok(Self::BankDebit),
             api_models::payments::PaymentMethodData::BankTransfer(..) => Ok(Self::BankTransfer),
             api_models::payments::PaymentMethodData::Crypto(..) => Ok(Self::Crypto),
-            api_models::payments::PaymentMethodData::Reward(..) => Ok(Self::Reward),
+            api_models::payments::PaymentMethodData::Reward => Ok(Self::Reward),
             api_models::payments::PaymentMethodData::Upi(..) => Ok(Self::Upi),
             api_models::payments::PaymentMethodData::Voucher(..) => Ok(Self::Voucher),
             api_models::payments::PaymentMethodData::GiftCard(..) => Ok(Self::GiftCard),
@@ -320,32 +383,28 @@ impl ForeignTryFrom<api_models::payments::PaymentMethodData> for api_enums::Paym
     }
 }
 
-impl ForeignTryFrom<storage_enums::RefundStatus> for storage_enums::EventType {
-    type Error = errors::ValidationError;
-
-    fn foreign_try_from(value: storage_enums::RefundStatus) -> Result<Self, Self::Error> {
+impl ForeignFrom<storage_enums::RefundStatus> for Option<storage_enums::EventType> {
+    fn foreign_from(value: storage_enums::RefundStatus) -> Self {
         match value {
-            storage_enums::RefundStatus::Success => Ok(Self::RefundSucceeded),
-            storage_enums::RefundStatus::Failure => Ok(Self::RefundFailed),
-            _ => Err(errors::ValidationError::IncorrectValueProvided {
-                field_name: "refund_status",
-            }),
+            storage_enums::RefundStatus::Success => Some(storage_enums::EventType::RefundSucceeded),
+            storage_enums::RefundStatus::Failure => Some(storage_enums::EventType::RefundFailed),
+            api_enums::RefundStatus::ManualReview
+            | api_enums::RefundStatus::Pending
+            | api_enums::RefundStatus::TransactionFailure => None,
         }
     }
 }
 
-impl ForeignTryFrom<storage_enums::DisputeStatus> for storage_enums::EventType {
-    type Error = errors::ValidationError;
-
-    fn foreign_try_from(value: storage_enums::DisputeStatus) -> Result<Self, Self::Error> {
+impl ForeignFrom<storage_enums::DisputeStatus> for storage_enums::EventType {
+    fn foreign_from(value: storage_enums::DisputeStatus) -> Self {
         match value {
-            storage_enums::DisputeStatus::DisputeOpened => Ok(Self::DisputeOpened),
-            storage_enums::DisputeStatus::DisputeExpired => Ok(Self::DisputeExpired),
-            storage_enums::DisputeStatus::DisputeAccepted => Ok(Self::DisputeAccepted),
-            storage_enums::DisputeStatus::DisputeCancelled => Ok(Self::DisputeCancelled),
-            storage_enums::DisputeStatus::DisputeChallenged => Ok(Self::DisputeChallenged),
-            storage_enums::DisputeStatus::DisputeWon => Ok(Self::DisputeWon),
-            storage_enums::DisputeStatus::DisputeLost => Ok(Self::DisputeLost),
+            storage_enums::DisputeStatus::DisputeOpened => Self::DisputeOpened,
+            storage_enums::DisputeStatus::DisputeExpired => Self::DisputeExpired,
+            storage_enums::DisputeStatus::DisputeAccepted => Self::DisputeAccepted,
+            storage_enums::DisputeStatus::DisputeCancelled => Self::DisputeCancelled,
+            storage_enums::DisputeStatus::DisputeChallenged => Self::DisputeChallenged,
+            storage_enums::DisputeStatus::DisputeWon => Self::DisputeWon,
+            storage_enums::DisputeStatus::DisputeLost => Self::DisputeLost,
         }
     }
 }
@@ -607,6 +666,9 @@ impl TryFrom<domain::MerchantConnectorAccount> for api_models::admin::MerchantCo
                     .change_context(errors::ApiErrorResponse::InternalServerError)
                 })
                 .transpose()?,
+            profile_id: item.profile_id,
+            applepay_verified_domains: item.applepay_verified_domains,
+            pm_auth_config: item.pm_auth_config,
         })
     }
 }
@@ -632,6 +694,25 @@ impl ForeignFrom<storage::PaymentAttempt> for api_models::payments::PaymentAttem
             payment_experience: payment_attempt.payment_experience,
             payment_method_type: payment_attempt.payment_method_type,
             reference_id: payment_attempt.connector_response_reference_id,
+        }
+    }
+}
+
+impl ForeignFrom<storage::Capture> for api_models::payments::CaptureResponse {
+    fn foreign_from(capture: storage::Capture) -> Self {
+        Self {
+            capture_id: capture.capture_id,
+            status: capture.status,
+            amount: capture.amount,
+            currency: capture.currency,
+            connector: capture.connector,
+            authorized_attempt_id: capture.authorized_attempt_id,
+            connector_capture_id: capture.connector_capture_id,
+            capture_sequence: capture.capture_sequence,
+            error_message: capture.error_message,
+            error_code: capture.error_code,
+            error_reason: capture.error_reason,
+            reference_id: capture.connector_response_reference_id,
         }
     }
 }
@@ -664,6 +745,30 @@ impl ForeignFrom<api_models::enums::PayoutType> for api_enums::PaymentMethod {
     }
 }
 
+impl ForeignTryFrom<&HeaderMap> for api_models::payments::HeaderPayload {
+    type Error = error_stack::Report<errors::ApiErrorResponse>;
+    fn foreign_try_from(headers: &HeaderMap) -> Result<Self, Self::Error> {
+        let payment_confirm_source: Option<api_enums::PaymentSource> =
+            get_header_value_by_key("payment_confirm_source".into(), headers)?
+                .map(|source| {
+                    source
+                        .to_owned()
+                        .parse_enum("PaymentSource")
+                        .change_context(errors::ApiErrorResponse::InvalidRequestData {
+                            message: "Invalid data received in payment_confirm_source header"
+                                .into(),
+                        })
+                        .attach_printable(
+                            "Failed while paring PaymentConfirmSource header value to enum",
+                        )
+                })
+                .transpose()?;
+        Ok(Self {
+            payment_confirm_source,
+        })
+    }
+}
+
 impl
     ForeignFrom<(
         Option<&storage::PaymentAttempt>,
@@ -691,6 +796,22 @@ impl
             phone: customer.and_then(|cust| cust.phone.as_ref().map(|p| p.clone().into_inner())),
             name: customer.and_then(|cust| cust.name.as_ref().map(|n| n.clone().into_inner())),
             ..Self::default()
+        }
+    }
+}
+
+impl From<domain::Address> for payments::AddressDetails {
+    fn from(addr: domain::Address) -> Self {
+        Self {
+            city: addr.city,
+            country: addr.country,
+            line1: addr.line1.map(Encryptable::into_inner),
+            line2: addr.line2.map(Encryptable::into_inner),
+            line3: addr.line3.map(Encryptable::into_inner),
+            zip: addr.zip.map(Encryptable::into_inner),
+            state: addr.state.map(Encryptable::into_inner),
+            first_name: addr.first_name.map(Encryptable::into_inner),
+            last_name: addr.last_name.map(Encryptable::into_inner),
         }
     }
 }
